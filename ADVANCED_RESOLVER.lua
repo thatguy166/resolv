@@ -101,11 +101,6 @@ local cfg = {
     enabled = ui.new_checkbox("RAGE", "Other", "Advanced Resolver"),
     debug_mode = ui.new_checkbox("RAGE", "Other", "Debug Mode"),
     show_watermark = ui.new_checkbox("RAGE", "Other", "Show Watermark"),
-    aggressive_mode = ui.new_checkbox("RAGE", "Other", "Aggressive Mode"),
-    adaptive_brute = ui.new_checkbox("RAGE", "Other", "Adaptive Brute Force"),
-    max_distance = ui.new_slider("RAGE", "Other", "Max Distance", 500, 5000, 2000, true, "u"),
-    confidence_threshold = ui.new_slider("RAGE", "Other", "Confidence Threshold", 10, 100, 70, true, "%"),
-    brute_force_speed = ui.new_slider("RAGE", "Other", "Brute Force Speed", 1, 10, 3, true),
 }
 
 -- Advanced data structures
@@ -121,6 +116,9 @@ local CONST = {
     MAX_TARGETS = 64,
     HISTORY_SIZE = 32,
     PATTERN_SIZE = 16,
+    MAX_DISTANCE = 3000,  -- Automated max distance
+    CONFIDENCE_THRESHOLD = 0.6,  -- Automated confidence threshold
+    BRUTE_FORCE_SPEED = 2,  -- Automated brute force speed
     BRUTE_OFFSETS = {60, -60, 90, -90, 45, -45, 30, -30, 120, -120, 15, -15, 75, -75, 105, -105},
     ANTI_AIM_PATTERNS = {
         JITTER = 1,
@@ -323,8 +321,8 @@ local function resolve_target(ent, data, local_player)
         end
     end
     
-    -- Layer 4: Brute force (adaptive)
-    if ui.get(cfg.adaptive_brute) and data.miss_count > 2 then
+    -- Layer 4: Brute force (automated)
+    if data.miss_count > CONST.BRUTE_FORCE_SPEED then
         local brute_index = (data.miss_count - 1) % #CONST.BRUTE_OFFSETS + 1
         local brute_offset = CONST.BRUTE_OFFSETS[brute_index]
         local brute_resolution = ideal_yaw + brute_offset
@@ -380,14 +378,14 @@ local function select_best_target(local_player)
                 local distance = get_distance_3d(my_origin[1], my_origin[2], my_origin[3], 
                                                target_origin[1], target_origin[2], target_origin[3])
                 
-                if distance <= ui.get(cfg.max_distance) then
+                if distance <= CONST.MAX_DISTANCE then
                     local angle_to_target = get_angle_to_position(my_origin[1], my_origin[2], 
                                                                 target_origin[1], target_origin[2])
                     local fov = angle_delta(my_angles[2], angle_to_target)
                     
                     -- Advanced scoring system
                     local fov_score = math_max(0, 180 - fov) / 180
-                    local distance_score = math_max(0, ui.get(cfg.max_distance) - distance) / ui.get(cfg.max_distance)
+                    local distance_score = math_max(0, CONST.MAX_DISTANCE - distance) / CONST.MAX_DISTANCE
                     local health_score = 1.0
                     local armor_score = 1.0
                     
@@ -478,7 +476,7 @@ local function draw_watermark()
             
             -- Resolution info
             local conf_percent = target_data.resolution_confidence * 100
-            local conf_color = conf_percent > 70 and {100, 255, 100} or {255, 200, 100}
+            local conf_color = conf_percent > (CONST.CONFIDENCE_THRESHOLD * 100) and {100, 255, 100} or {255, 200, 100}
             renderer_text(x, y, conf_color[1], conf_color[2], conf_color[3], 255, nil, 0, 
                          string_format("Confidence: %.0f%%", conf_percent))
             y = y + 16
@@ -580,10 +578,8 @@ local function on_aim_miss(event)
     target_data.miss_count = target_data.miss_count + 1
     target_data.last_miss_tick = globals_tickcount()
     
-    -- Adaptive brute force
-    if ui.get(cfg.adaptive_brute) then
-        target_data.brute_index = (target_data.brute_index + 1) % #CONST.BRUTE_OFFSETS
-    end
+    -- Automated brute force
+    target_data.brute_index = (target_data.brute_index + 1) % #CONST.BRUTE_OFFSETS
 end
 
 local function on_aim_hit(event)
@@ -617,4 +613,5 @@ client.set_event_callback("round_start", on_round_start)
 -- Success message
 client.color_log(100, 255, 100, "[Advanced Resolver] Loaded - FFI Pattern Detection Active")
 client.color_log(120, 180, 255, "[Advanced Resolver] Multi-layer resolution system initialized")
-client.color_log(255, 200, 100, "[Advanced Resolver] Adaptive brute force enabled")
+client.color_log(255, 200, 100, "[Advanced Resolver] Automated brute force enabled")
+client.color_log(180, 255, 180, "[Advanced Resolver] All settings automated - Maximum hit rate mode")
