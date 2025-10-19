@@ -18,6 +18,7 @@ local math_abs = math.abs
 local math_sqrt = math.sqrt
 local math_deg = math.deg
 local math_atan2 = math.atan2
+local math_floor = math.floor
 local math_min = math.min
 local math_max = math.max
 local client_camera_angles = client.camera_angles
@@ -42,6 +43,11 @@ local CONST = {
     BODY_THRESHOLD = 30,
     DEF_SIMTIME_MULT = 1.7,
     HISTORY_SIZE = 8,               -- Reduced from 16
+    JITTER_FLIP_WINDOW = 6,
+    MICRO_JITTER_MAX = 18,          -- Amplitude threshold for micro jitter
+    DEF_SPEED_MAX = 8.0,            -- Stationary threshold in u/s
+    LBY_CHANGE_MIN = 25,
+    LBY_RECENT_TIME = 0.45,
 }
 
 -- Fast angle math
@@ -79,14 +85,20 @@ local function init_target(ent)
             lst = 0,                -- last simtime
             jt = false,             -- jitter active
             js = 0,                 -- jitter side
+            jtype = "NONE",         -- jitter type: NONE/MICRO/LARGE
+            amp = 0,                -- average amplitude
             df = false,             -- defensive
             dt = 0,                 -- defensive tick
             res = 0,                -- resolved angle
             conf = 0,               -- confidence
             meth = "NONE",          -- method
+            pat = "NONE",           -- pattern label for UI
             h = 0,                  -- hits
             m = 0,                  -- misses
             bi = 0,                 -- brute index
+            spd = 0,                -- speed
+            lby = nil,              -- last LBY value
+            lbyt = 0,               -- last LBY update time
         }
     end
     return targets[ent]
@@ -140,21 +152,41 @@ end
 
 -- Detect jitter (ultra-fast)
 local function check_jitter(t)
-    if t.c < 4 then return false end
-    
-    local flips, side = 0, 0
-    for i = 0, 3 do
+    if t.c < 4 then
+        t.jt = false
+        t.jtype = "NONE"
+        t.amp = 0
+        return false
+    end
+
+    local flips, side, sum_amp, samples = 0, 0, 0, 0
+    local last_sign = 0
+    for i = 0, math_min(CONST.JITTER_FLIP_WINDOW, t.c - 1) - 1 do
         local i1 = (t.i - i - 1) % CONST.HISTORY_SIZE + 1
         local i2 = (t.i - i - 2) % CONST.HISTORY_SIZE + 1
         local d = norm(t.a[i1] - t.a[i2])
-        if math_abs(d) > CONST.JITTER_THRESHOLD then
-            flips = flips + 1
-            side = side + (d > 0 and 1 or -1)
+        local ad = math_abs(d)
+        if ad > 0.1 then
+            local s = d > 0 and 1 or -1
+            if last_sign ~= 0 and s ~= last_sign and ad > CONST.JITTER_THRESHOLD then
+                flips = flips + 1
+            end
+            last_sign = s
+            side = side + s
+            sum_amp = sum_amp + ad
+            samples = samples + 1
         end
     end
-    
+
+    local avg_amp = samples > 0 and (sum_amp / samples) or 0
+    t.amp = avg_amp
     t.jt = flips >= 2
-    t.js = side > 0 and 1 or -1
+    t.js = side >= 0 and 1 or -1
+    if t.jt then
+        t.jtype = (avg_amp <= CONST.MICRO_JITTER_MAX) and "MICRO" or "LARGE"
+    else
+        t.jtype = "NONE"
+    end
     return t.jt
 end
 
@@ -205,38 +237,66 @@ local function resolve(ent, t, me)
     -- Body yaw
     local by = entity_get_prop(ent, "m_flLowerBodyYawTarget")
     if by then
+        -- LBY update tracking
+        if t.lby ~= nil then
+            local lby_delta = norm(by - t.lby)
+            if math_abs(lby_delta) >= CONST.LBY_CHANGE_MIN then
+                t.lbyt = globals_realtime()
+            end
+        end
+        t.lby = by
         t.by = by
         t.bd = norm(by - ideal)
     end
     
+    -- Speed
+    do
+        local vx = entity_get_prop(ent, "m_vecVelocity[0]") or 0
+        local vy = entity_get_prop(ent, "m_vecVelocity[1]") or 0
+        t.spd = math_sqrt(vx*vx + vy*vy)
+    end
+
     -- Detections
     local jit = check_jitter(t)
-    local def = check_defensive(ent, t)
+    local def = check_defensive(ent, t) or (t.spd <= CONST.DEF_SPEED_MAX and t.jt)
     
     -- Resolve
     local ang, w = 0, 0
-    local body_off = math_abs(t.bd) > CONST.BODY_THRESHOLD and (t.bd > 0 and 60 or -60) or 0
+    local body_off = 0
+    if math_abs(t.bd) > CONST.BODY_THRESHOLD then
+        body_off = (t.bd > 0 and 60 or -60)
+    end
     
     -- Body layer
-    local ba = ideal + body_off
-    ang = ang + ba * 0.45
-    w = w + 0.45
-    t.meth = "BODY"
+    if body_off ~= 0 then
+        local ba = ideal + body_off
+        local recent_lby = (globals_realtime() - (t.lbyt or 0)) <= CONST.LBY_RECENT_TIME
+        local bw = recent_lby and 0.60 or 0.40
+        ang = ang + ba * bw
+        w = w + bw
+        t.meth = "BODY"
+        t.pat = recent_lby and "LBY UPDATE" or "BODY"
+    end
     
     -- Jitter layer
     if jit then
-        local ja = ideal + (58 * t.js)
-        ang = ang + ja * 0.35
-        w = w + 0.35
-        t.meth = "JITTER"
+        local magnitude = 58
+        if t.jtype == "MICRO" then magnitude = 30 end
+        local ja = ideal + (magnitude * t.js)
+        local jw = (t.jtype == "MICRO") and 0.30 or 0.40
+        ang = ang + ja * jw
+        w = w + jw
+        t.meth = (t.jtype == "MICRO") and "JIT-MICRO" or "JITTER"
+        t.pat = t.meth
     end
     
     -- Defensive layer
     if def then
         local da = t.a[math_max(1, t.i - 2)]
-        ang = ang + da * 0.15
-        w = w + 0.15
+        ang = ang + da * 0.20
+        w = w + 0.20
         t.meth = "DEFENSIVE"
+        t.pat = "DEFENSIVE"
     end
     
     -- Brute layer
@@ -247,7 +307,11 @@ local function resolve(ent, t, me)
     
     -- Finalize
     t.res = w > 0 and norm(ang / w) or ideal
-    t.conf = math_min(w, 1)
+    -- Confidence: clamp [0,1], bias by stability
+    local base_conf = math_min(w, 1)
+    if t.jt and t.jtype == "MICRO" then base_conf = base_conf * 0.95 end
+    if def then base_conf = math_min(1, base_conf + 0.05) end
+    t.conf = base_conf
     
     -- Apply
     plist_set(ent, "Override yaw", t.res)
@@ -287,7 +351,12 @@ local function draw_info()
     renderer_text(x, y, dr, 150, 150, 255, nil, 0, string.format("Δ: %.0f°", t.bd))
     y = y + 16
     
-    -- Status
+    -- Pattern / Status
+    if t.pat and t.pat ~= "NONE" then
+        renderer_text(x, y, 200, 220, 255, 255, "b", 0, t.pat)
+        y = y + 14
+    end
+
     if t.jt then
         renderer_text(x, y, 255, 100, 100, 255, nil, 0, "JIT " .. (t.js > 0 and "R" or "L"))
         y = y + 14
@@ -297,6 +366,10 @@ local function draw_info()
         renderer_text(x, y, 200, 100, 255, 255, nil, 0, "DEFENSIVE")
         y = y + 14
     end
+
+    -- Speed
+    renderer_text(x, y, 180, 220, 180, 255, nil, 0, "Spd: " .. tostring(math_floor((t.spd or 0) + 0.5)))
+    y = y + 14
     
     -- Method
     local mr = t.meth == "BODY" and 100 or (t.meth == "JITTER" and 255 or 200)
